@@ -1,43 +1,286 @@
+import smtplib
+import threading
+import time
+import traceback
+from datetime import timedelta
+from email.message import EmailMessage
+from typing import Dict, List, Optional, Tuple
 
 import requests
-from datetime import datetime, timedelta
-from utils import iso, rule_matches
-from storage import append_log
 
-REQUEST_TIMEOUT = 10
+from models import AppConfig, Profile, SmtpSettings
+from storage import append_log_record, safe_write_error, scan_history_from_logs
+from utils import iso, now_local, parse_datetime_user, rule_matches
 
-def check_profile(profile):
+
+REQUEST_TIMEOUT_SECONDS = 10.0
+
+
+def check_url(profile: Profile) -> Tuple[str, Optional[int], Optional[int], str]:
+    """
+    Returns: (status, http_status, latency_ms, details)
+      status: "up" | "down"
+    """
+    t0 = time.time()
     try:
-        r = requests.get(profile.url, timeout=REQUEST_TIMEOUT)
-        body = r.text or ""
+        resp = requests.get(
+            profile.url,
+            timeout=REQUEST_TIMEOUT_SECONDS,
+            allow_redirects=True,
+            headers={"User-Agent": "DownDetector/1.0"}
+        )
+        latency_ms = int((time.time() - t0) * 1000)
+        http_status = int(resp.status_code)
+        body = resp.text or ""
+
         for fr in profile.failure_rules:
             if rule_matches(fr, body):
-                return "down", r.status_code
+                return ("down", http_status, latency_ms, f"Failure rule matched: {fr}")
+
         if profile.success_rules:
-            if not any(rule_matches(sr, body) for sr in profile.success_rules):
-                return "down", r.status_code
-        return ("up" if 200 <= r.status_code < 400 else "down"), r.status_code
-    except Exception:
-        return "down", None
+            any_ok = False
+            for sr in profile.success_rules:
+                if rule_matches(sr, body):
+                    any_ok = True
+                    break
+            if not any_ok:
+                return ("down", http_status, latency_ms, "No success rule matched")
 
-def run_tick(profile, base_dir):
-    now = datetime.now()
-    start = datetime.fromisoformat(profile.start_datetime)
-    elapsed = (now - start).total_seconds()
-    idx = int(elapsed // profile.interval_seconds)
-    scheduled = start + timedelta(seconds=idx * profile.interval_seconds)
-    status, http_status = check_profile(profile)
+        if 200 <= http_status < 400:
+            return ("up", http_status, latency_ms, "HTTP OK")
+        return ("down", http_status, latency_ms, f"HTTP {http_status}")
+    except Exception as e:
+        latency_ms = int((time.time() - t0) * 1000)
+        return ("down", None, latency_ms, repr(e))
 
-    record = {
-        "ts": iso(now),
-        "profile_id": profile.profile_id,
-        "display_name": profile.display_name,
-        "interval_index": idx,
-        "scheduled_time": iso(scheduled),
-        "status": status,
-        "http_status": http_status
-    }
-    append_log(base_dir, record)
-    profile.last_interval_index_ran = idx
-    profile.last_status = status
-    return status
+
+def send_email_on_fail(
+    smtp: SmtpSettings,
+    error_log_path: str,
+    profile: Profile,
+    scheduled_time,
+    status_details: str,
+    http_status: Optional[int],
+    latency_ms: Optional[int]
+) -> None:
+    if not smtp.enabled:
+        return
+
+    to_addr = (smtp.to_email or "").strip()
+    host = (smtp.host or "").strip()
+    if not to_addr or not host:
+        return
+
+    if smtp.only_on_transition_to_down:
+        if (profile.last_status or "").lower() == "down":
+            return
+
+    from_addr = (smtp.from_email or "").strip()
+    if not from_addr:
+        from_addr = (smtp.username or "").strip() or "down-detector@localhost"
+
+    msg = EmailMessage()
+    msg["Subject"] = f"Down Detector: DOWN - {profile.display_name}"
+    msg["From"] = from_addr
+    msg["To"] = to_addr
+
+    lines = [
+        f"Site: {profile.display_name}",
+        f"Scheduled time: {iso(scheduled_time)}",
+        f"Observed at: {iso(now_local())}",
+        "Status: DOWN",
+        f"HTTP status: {http_status if http_status is not None else 'N/A'}",
+        f"Latency ms: {latency_ms if latency_ms is not None else 'N/A'}",
+        f"Details: {status_details}",
+    ]
+    msg.set_content("\n".join(lines))
+
+    try:
+        port = int(smtp.port or 0) or 587
+
+        if smtp.use_tls:
+            server = smtplib.SMTP(host, port)
+            server.starttls()
+        else:
+            server = smtplib.SMTP(host, port)
+
+        user = (smtp.username or "").strip()
+        pwd = (smtp.password or "").strip()
+        if user and pwd:
+            server.login(user, pwd)
+
+        server.send_message(msg)
+        server.quit()
+    except Exception as e:
+        safe_write_error(error_log_path, "Email send failed: " + repr(e))
+
+
+class MonitorEngine:
+    def __init__(self, cfg: AppConfig, log_dir: str, meta_path: str, error_log_path: str) -> None:
+        self._lock = threading.Lock()
+        self.cfg = cfg
+        self.log_dir = log_dir
+        self.meta_path = meta_path
+        self.error_log_path = error_log_path
+
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+
+        self.history_cache: Dict[str, Dict[int, str]] = scan_history_from_logs(
+            self.log_dir, self.error_log_path, [p.profile_id for p in self.cfg.profiles], max_files=2
+        )
+
+    def start(self) -> None:
+        with self._lock:
+            if self._running:
+                return
+            self._running = True
+
+        self._thread = threading.Thread(target=self._loop, name="DownDetectorEngine", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        with self._lock:
+            self._running = False
+
+    def _loop(self) -> None:
+        while True:
+            try:
+                with self._lock:
+                    if not self._running:
+                        return
+                    profiles = list(self.cfg.profiles)
+                    smtp = self.cfg.smtp
+
+                now = now_local()
+                for p in profiles:
+                    try:
+                        self._tick_profile(p, smtp, now)
+                    except Exception:
+                        safe_write_error(self.error_log_path, "tick_profile failed:\n" + traceback.format_exc())
+
+                time.sleep(0.5)
+            except Exception:
+                safe_write_error(self.error_log_path, "engine loop failed:\n" + traceback.format_exc())
+                time.sleep(1.0)
+
+    def _tick_profile(self, p: Profile, smtp: SmtpSettings, now) -> None:
+        start_dt = parse_datetime_user(p.start_datetime)
+        interval = int(p.interval_seconds)
+        if interval <= 0:
+            return
+
+        if now < start_dt:
+            return
+
+        elapsed = (now - start_dt).total_seconds()
+        current_index = int(elapsed // interval)
+        scheduled_time = start_dt + timedelta(seconds=current_index * interval)
+
+        with self._lock:
+            last_ran = p.last_interval_index_ran
+
+        if last_ran is not None and last_ran >= current_index:
+            return
+
+        status, http_status, latency_ms, details = check_url(p)
+
+        record = {
+            "ts": iso(now_local()),
+            "profile_id": p.profile_id,
+            "display_name": p.display_name,
+            "interval_seconds": p.interval_seconds,
+            "start_datetime": p.start_datetime,
+            "interval_index": current_index,
+            "scheduled_time": iso(scheduled_time),
+            "status": status,
+            "http_status": http_status,
+            "latency_ms": latency_ms,
+            "details": details,
+        }
+        append_log_record(self.log_dir, self.meta_path, self.error_log_path, record)
+
+        if status == "down":
+            send_email_on_fail(
+                smtp, self.error_log_path, p, scheduled_time, details, http_status, latency_ms
+            )
+
+        with self._lock:
+            p.last_interval_index_ran = current_index
+            p.last_status = status
+            if p.profile_id not in self.history_cache:
+                self.history_cache[p.profile_id] = {}
+            self.history_cache[p.profile_id][current_index] = status
+
+    def rescan_history_for_profiles(self, profile_ids: List[str]) -> None:
+        more = scan_history_from_logs(self.log_dir, self.error_log_path, profile_ids, max_files=2)
+        with self._lock:
+            for pid, mp in more.items():
+                if pid not in self.history_cache:
+                    self.history_cache[pid] = {}
+                self.history_cache[pid].update(mp)
+
+    def get_snapshot(self) -> AppConfig:
+        with self._lock:
+            return self.cfg
+
+    def set_smtp(self, smtp: SmtpSettings) -> None:
+        with self._lock:
+            self.cfg.smtp = smtp
+
+    def add_profile(self, p: Profile) -> None:
+        with self._lock:
+            self.cfg.profiles.append(p)
+            if p.profile_id not in self.history_cache:
+                self.history_cache[p.profile_id] = {}
+        self.rescan_history_for_profiles([p.profile_id])
+
+    def update_profile(self, profile_id: str, display_name: str, url: str, start_datetime: str, success_rules: List[str], failure_rules: List[str]) -> bool:
+        with self._lock:
+            for p in self.cfg.profiles:
+                if p.profile_id == profile_id:
+                    p.display_name = display_name
+                    p.url = url
+                    p.start_datetime = start_datetime
+                    p.success_rules = list(success_rules)
+                    p.failure_rules = list(failure_rules)
+                    return True
+        return False
+
+    def delete_profile(self, profile_id: str) -> None:
+        with self._lock:
+            self.cfg.profiles = [p for p in self.cfg.profiles if p.profile_id != profile_id]
+            if profile_id in self.history_cache:
+                del self.history_cache[profile_id]
+
+    def get_last30_bars(self, p: Profile) -> List[str]:
+        """
+        Returns 30 statuses: "untested"|"up"|"down"
+        Based on interval indices relative to the profile start time.
+        """
+        try:
+            now = now_local()
+            start_dt = parse_datetime_user(p.start_datetime)
+            if now < start_dt:
+                return ["untested"] * 30
+
+            interval = int(p.interval_seconds)
+            if interval <= 0:
+                return ["untested"] * 30
+
+            elapsed = (now - start_dt).total_seconds()
+            cur = int(elapsed // interval)
+            start_idx = cur - 29
+
+            with self._lock:
+                cache = dict(self.history_cache.get(p.profile_id, {}))
+
+            out = []
+            for idx in range(start_idx, cur + 1):
+                if idx in cache:
+                    out.append(cache[idx])
+                else:
+                    out.append("untested")
+            return out
+        except Exception:
+            return ["untested"] * 30
