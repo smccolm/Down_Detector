@@ -1,0 +1,20 @@
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+
+# Logs and app runtime data
+Logs/
+*.log
+
+# OS and editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.vs/
