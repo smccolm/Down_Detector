@@ -48,6 +48,7 @@ def load_config() -> AppConfig:
                 failure_rules=list(p.get("failure_rules", []) or []),
                 last_interval_index_ran=p.get("last_interval_index_ran", None),
                 last_status=p.get("last_status", None),
+                down_notified=bool(p.get("down_notified", False)),
             ))
         except Exception:
             continue
@@ -79,19 +80,9 @@ def ui_get_slots():
     updates = []
 
     if len(profiles) == 0:
-        updates.append((
-            gr.update(visible=True),
-            render_empty_dashboard_html(),
-            "",
-            gr.update(value="Edit", visible=False),
-        ))
+        updates.append((gr.update(visible=True), render_empty_dashboard_html(), "", gr.update(value="Edit", visible=False)))
         for _ in range(1, MAX_WIDGET_SLOTS):
-            updates.append((
-                gr.update(visible=False),
-                "",
-                "",
-                gr.update(value="Edit", visible=False),
-            ))
+            updates.append((gr.update(visible=False), "", "", gr.update(value="Edit", visible=False)))
         return updates
 
     for i in range(MAX_WIDGET_SLOTS):
@@ -99,36 +90,34 @@ def ui_get_slots():
             p = profiles[i]
             bars = ENGINE.get_last30_bars(p)
             html = render_card_html(p, bars)
-            updates.append((
-                gr.update(visible=True),
-                html,
-                p.profile_id,
-                gr.update(value="Edit", visible=True),
-            ))
+            updates.append((gr.update(visible=True), html, p.profile_id, gr.update(value="Edit", visible=True)))
         else:
-            updates.append((
-                gr.update(visible=False),
-                "",
-                "",
-                gr.update(value="Edit", visible=False),
-            ))
+            updates.append((gr.update(visible=False), "", "", gr.update(value="Edit", visible=False)))
 
     return updates
+
+
+def _split_interval(seconds: int):
+    seconds = int(seconds or 0)
+    dd = seconds // 86400
+    rem = seconds % 86400
+    hh = rem // 3600
+    rem = rem % 3600
+    mm = rem // 60
+    ss = rem % 60
+    return dd, hh, mm, ss
 
 
 def ui_open_add_form():
     return (
         gr.update(visible=True),
-        "",  # display_name
-        "",  # url
-        iso(now_local()),  # start
-        0, 0, 5, 0,  # dd hh mm ss
-        "",  # success rules
-        "Application is not available",  # failure rules
-        "",  # msg
-        "",  # edit_profile_id
-        gr.update(visible=True),   # interval row visible for add
-        gr.update(visible=False),  # delete hidden for add
+        "", "", iso(now_local()),
+        gr.update(value=0, interactive=True),
+        gr.update(value=0, interactive=True),
+        gr.update(value=5, interactive=True),
+        gr.update(value=0, interactive=True),
+        "", "Application is not available",
+        "", "", gr.update(visible=False),
     )
 
 
@@ -139,32 +128,25 @@ def ui_open_edit_form(profile_id: str):
         if x.profile_id == profile_id:
             p = x
             break
-
     if not p:
-        return (
-            gr.update(visible=False),
-            "", "", "", 0, 0, 0, 0, "", "", "Profile not found.", "", gr.update(visible=False), gr.update(visible=False)
-        )
+        return (gr.update(visible=False), "", "", "", gr.update(value=0), gr.update(value=0), gr.update(value=0), gr.update(value=0), "", "", "Profile not found.", "", gr.update(visible=False))
 
-    dd = p.interval_seconds // 86400
-    rem = p.interval_seconds % 86400
-    hh = rem // 3600
-    rem = rem % 3600
-    mm = rem // 60
-    ss = rem % 60
+    dd, hh, mm, ss = _split_interval(p.interval_seconds)
 
     return (
         gr.update(visible=True),
         p.display_name,
         p.url,
         p.start_datetime,
-        dd, hh, mm, ss,
+        gr.update(value=dd, interactive=False),
+        gr.update(value=hh, interactive=False),
+        gr.update(value=mm, interactive=False),
+        gr.update(value=ss, interactive=False),
         "\n".join(p.success_rules),
         "\n".join(p.failure_rules),
         "",
         p.profile_id,
-        gr.update(visible=False),  # interval row hidden for edit
-        gr.update(visible=True),   # delete visible
+        gr.update(visible=True),
     )
 
 
@@ -178,7 +160,6 @@ def ui_save_add(display_name: str, url: str, start_dt: str, dd, hh, mm, ss, succ
             return "URL is required."
 
         parse_datetime_user(start_dt)
-
         interval_seconds = duration_to_seconds(dd, hh, mm, ss)
         if interval_seconds <= 0:
             return "Interval must be greater than 0."
@@ -262,7 +243,7 @@ def ui_save_smtp(enabled: bool, to_email: str, host: str, port: int, username: s
             host=(host or "").strip(),
             port=int(port or 0) if str(port or "").strip() else 0,
             username=(username or "").strip(),
-            password="",  # not stored, pulled from Credential Manager
+            password="",
             use_tls=bool(use_tls),
             from_email=(from_email or "").strip(),
             only_on_transition_to_down=bool(only_transition),
@@ -276,20 +257,7 @@ def ui_save_smtp(enabled: bool, to_email: str, host: str, port: int, username: s
         return "Save failed: " + repr(e)
 
 
-def ui_send_test_email(
-    enabled: bool,
-    to_email: str,
-    host: str,
-    port: int,
-    username: str,
-    use_tls: bool,
-    from_email: str,
-    only_transition: bool,
-) -> str:
-    """
-    Uses CURRENT UI values, not saved config. This lets you test without clicking Save first.
-    Always writes a trace line to Logs/error.log.
-    """
+def ui_send_test_email(enabled: bool, to_email: str, host: str, port: int, username: str, use_tls: bool, from_email: str, only_transition: bool) -> str:
     try:
         s = SmtpSettings(
             enabled=bool(enabled),
@@ -297,21 +265,12 @@ def ui_send_test_email(
             host=(host or "").strip(),
             port=int(port or 0) if str(port or "").strip() else 0,
             username=(username or "").strip(),
-            password="",  # pulled from Credential Manager
+            password="",
             use_tls=bool(use_tls),
             from_email=(from_email or "").strip(),
             only_on_transition_to_down=bool(only_transition),
         )
-
-        safe_write_error(
-            ERROR_LOG_PATH,
-            "Test email clicked: enabled=" + str(s.enabled) +
-            " host=" + (s.host or "") +
-            " port=" + str(s.port or "") +
-            " user=" + (s.username or "") +
-            " to=" + (s.to_email or "")
-        )
-
+        safe_write_error(ERROR_LOG_PATH, "Test email clicked: enabled=" + str(s.enabled) + " host=" + (s.host or "") + " port=" + str(s.port or "") + " user=" + (s.username or "") + " to=" + (s.to_email or ""))
         ok, msg = send_test_email(s, ERROR_LOG_PATH)
         return msg
     except Exception as e:
@@ -324,13 +283,9 @@ with gr.Blocks(title="Down Detector", theme=gr.themes.Soft()) as demo:
         gr.Markdown("## Down Detector")
         add_btn = gr.Button("Add", size="sm")
 
-    slot_groups = []
-    slot_cards = []
-    slot_pids = []
-    slot_edit_btns = []
-
+    slot_groups, slot_cards, slot_pids, slot_edit_btns = [], [], [], []
     with gr.Group():
-        for i in range(MAX_WIDGET_SLOTS):
+        for _ in range(MAX_WIDGET_SLOTS):
             with gr.Group(visible=False) as g:
                 with gr.Row():
                     card = gr.HTML()
@@ -349,24 +304,16 @@ with gr.Blocks(title="Down Detector", theme=gr.themes.Soft()) as demo:
         url_in = gr.Textbox(label="URL", placeholder="https://example.com/landing")
         start_dt_in = gr.Textbox(label="Start datetime (local)", placeholder="YYYY-MM-DD HH:MM[:SS]")
 
-        with gr.Row(visible=True) as interval_row:
+        with gr.Row():
             dd_in = gr.Number(label="dd", value=0, precision=0)
             hh_in = gr.Number(label="hh", value=0, precision=0)
             mm_in = gr.Number(label="mm", value=5, precision=0)
             ss_in = gr.Number(label="ss", value=0, precision=0)
 
-        gr.Markdown("Interval becomes read-only after the initial save.")
+        gr.Markdown("Interval is editable only when creating a new profile.")
 
-        success_rules_in = gr.Textbox(
-            label="Success match rules (optional, one per line). Use re: for regex.",
-            lines=4,
-            placeholder="Example:\nre:<title>My App</title>\nWelcome",
-        )
-        failure_rules_in = gr.Textbox(
-            label="Failure match rules (optional, one per line). Use re: for regex.",
-            lines=4,
-            placeholder="Example:\nApplication is not available\nre:5\\d\\d\\s+Internal Server Error",
-        )
+        success_rules_in = gr.Textbox(label="Success match rules (optional, one per line). Use re: for regex.", lines=4)
+        failure_rules_in = gr.Textbox(label="Failure match rules (optional, one per line). Use re: for regex.", lines=4)
 
         with gr.Row():
             save_btn = gr.Button("Save", variant="primary")
@@ -377,28 +324,24 @@ with gr.Blocks(title="Down Detector", theme=gr.themes.Soft()) as demo:
 
     with gr.Accordion("Email on fail (optional)", open=False):
         enabled_in = gr.Checkbox(label="Enable email on failure", value=False)
-        to_email_in = gr.Textbox(label="To email address", placeholder="you@company.com or you@gmail.com")
+        to_email_in = gr.Textbox(label="To email address")
         host_in = gr.Textbox(label="SMTP host", placeholder="smtp.gmail.com")
         port_in = gr.Number(label="SMTP port", value=587, precision=0)
-        username_in = gr.Textbox(label="SMTP username", placeholder="you@gmail.com")
+        username_in = gr.Textbox(label="SMTP username")
         use_tls_in = gr.Checkbox(label="Use TLS (STARTTLS)", value=True)
-        from_email_in = gr.Textbox(label="From email (optional)", placeholder="you@gmail.com")
+        from_email_in = gr.Textbox(label="From email (optional)")
         only_transition_in = gr.Checkbox(label="Only email when status transitions to Down", value=True)
 
         with gr.Row():
             save_smtp_btn = gr.Button("Save email settings")
-            test_email_btn = gr.Button("Send test email", variant="secondary")
+            test_email_btn = gr.Button("Send test email")
 
         smtp_msg = gr.Markdown("")
         test_msg = gr.Markdown("")
 
-        gr.Markdown(
-            "Password is not entered here. Store it in Windows Credential Manager as a Generic Credential named `DownDetectorSMTP` with username equal to the SMTP username."
-        )
+        gr.Markdown("Password is not entered here. Store it in Windows Credential Manager as a Generic Credential named `DownDetectorSMTP` with username equal to the SMTP username.")
 
-    demo.load(fn=ui_get_smtp_snapshot, outputs=[
-        enabled_in, to_email_in, host_in, port_in, username_in, use_tls_in, from_email_in, only_transition_in
-    ])
+    demo.load(fn=ui_get_smtp_snapshot, outputs=[enabled_in, to_email_in, host_in, port_in, username_in, use_tls_in, from_email_in, only_transition_in])
 
     timer = gr.Timer(DEFAULT_REFRESH_SECONDS)
 
@@ -418,22 +361,19 @@ with gr.Blocks(title="Down Detector", theme=gr.themes.Soft()) as demo:
 
     add_btn.click(
         fn=ui_open_add_form,
-        outputs=[editor_group, display_name_in, url_in, start_dt_in, dd_in, hh_in, mm_in, ss_in, success_rules_in, failure_rules_in, save_msg, edit_profile_id, interval_row, delete_btn]
+        outputs=[editor_group, display_name_in, url_in, start_dt_in, dd_in, hh_in, mm_in, ss_in, success_rules_in, failure_rules_in, save_msg, edit_profile_id, delete_btn]
     )
 
     def open_edit_from_pid(pid: str):
         if not pid:
-            return (
-                gr.update(visible=False),
-                "", "", "", 0, 0, 0, 0, "", "", "Profile not found.", "", gr.update(visible=False), gr.update(visible=False)
-            )
+            return (gr.update(visible=False), "", "", "", gr.update(value=0), gr.update(value=0), gr.update(value=0), gr.update(value=0), "", "", "Profile not found.", "", gr.update(visible=False))
         return ui_open_edit_form(pid)
 
     for i in range(MAX_WIDGET_SLOTS):
         slot_edit_btns[i].click(
             fn=open_edit_from_pid,
             inputs=[slot_pids[i]],
-            outputs=[editor_group, display_name_in, url_in, start_dt_in, dd_in, hh_in, mm_in, ss_in, success_rules_in, failure_rules_in, save_msg, edit_profile_id, interval_row, delete_btn]
+            outputs=[editor_group, display_name_in, url_in, start_dt_in, dd_in, hh_in, mm_in, ss_in, success_rules_in, failure_rules_in, save_msg, edit_profile_id, delete_btn]
         )
 
     def do_save(edit_pid: str, display_name: str, url: str, start_dt: str, dd, hh, mm, ss, sr: str, fr: str):
@@ -457,17 +397,8 @@ with gr.Blocks(title="Down Detector", theme=gr.themes.Soft()) as demo:
 
     close_btn.click(fn=lambda: gr.update(visible=False), outputs=editor_group)
 
-    save_smtp_btn.click(
-        fn=ui_save_smtp,
-        inputs=[enabled_in, to_email_in, host_in, port_in, username_in, use_tls_in, from_email_in, only_transition_in],
-        outputs=smtp_msg
-    )
-
-    test_email_btn.click(
-        fn=ui_send_test_email,
-        inputs=[enabled_in, to_email_in, host_in, port_in, username_in, use_tls_in, from_email_in, only_transition_in],
-        outputs=test_msg
-    )
+    save_smtp_btn.click(fn=ui_save_smtp, inputs=[enabled_in, to_email_in, host_in, port_in, username_in, use_tls_in, from_email_in, only_transition_in], outputs=smtp_msg)
+    test_email_btn.click(fn=ui_send_test_email, inputs=[enabled_in, to_email_in, host_in, port_in, username_in, use_tls_in, from_email_in, only_transition_in], outputs=test_msg)
 
     gr.Markdown("Data files are stored in `./Logs/` next to `app.py`. Main log files rotate after 2000 records. App issues go to `Logs/error.log`.")
 

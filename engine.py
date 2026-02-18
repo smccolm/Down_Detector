@@ -17,24 +17,14 @@ CRED_SERVICE_NAME = "DownDetectorSMTP"
 
 
 def _get_password_from_credential_manager(error_log_path: str, username: str) -> str:
-    """
-    Reads a password stored in Windows Credential Manager using keyring.
-
-    Credential must exist as:
-      - Generic Credential name: DownDetectorSMTP
-      - User name: <smtp username> (for Gmail, your@gmail.com)
-      - Password: app password
-    """
     user = (username or "").strip()
     if not user:
         return ""
-
     try:
-        import keyring  # pip install keyring
+        import keyring
     except Exception as e:
         safe_write_error(error_log_path, "keyring not available. Install with: pip install keyring. " + repr(e))
         return ""
-
     try:
         pw = keyring.get_password(CRED_SERVICE_NAME, user)
         return (pw or "").strip()
@@ -53,11 +43,8 @@ def _build_email_message(subject: str, from_addr: str, to_addr: str, lines: List
 
 
 def send_test_email(smtp: SmtpSettings, error_log_path: str) -> Tuple[bool, str]:
-    """
-    Sends a single test email using the same settings as failure emails.
-    Returns (ok, message).
-    """
     if not smtp.enabled:
+        safe_write_error(error_log_path, "Test email: blocked because smtp.enabled is False")
         return (False, "Email is disabled. Enable it first.")
 
     to_addr = (smtp.to_email or "").strip()
@@ -65,10 +52,13 @@ def send_test_email(smtp: SmtpSettings, error_log_path: str) -> Tuple[bool, str]
     user = (smtp.username or "").strip()
 
     if not to_addr:
+        safe_write_error(error_log_path, "Test email: blocked because To email address is blank")
         return (False, "To email address is required.")
     if not host:
+        safe_write_error(error_log_path, "Test email: blocked because SMTP host is blank")
         return (False, "SMTP host is required.")
     if not user:
+        safe_write_error(error_log_path, "Test email: blocked because SMTP username is blank")
         return (False, "SMTP username is required.")
 
     password = _get_password_from_credential_manager(error_log_path, user)
@@ -90,7 +80,6 @@ def send_test_email(smtp: SmtpSettings, error_log_path: str) -> Tuple[bool, str]
         f"SMTP port: {port}",
         f"SMTP username: {user}",
         f"To: {to_addr}",
-        "If you received this, SMTP wiring is working.",
     ]
     msg = _build_email_message(subject, from_addr, to_addr, lines)
 
@@ -110,10 +99,6 @@ def send_test_email(smtp: SmtpSettings, error_log_path: str) -> Tuple[bool, str]
 
 
 def check_url(profile: Profile) -> Tuple[str, Optional[int], Optional[int], str]:
-    """
-    Returns: (status, http_status, latency_ms, details)
-      status: "up" | "down"
-    """
     t0 = time.time()
     try:
         resp = requests.get(
@@ -162,13 +147,8 @@ def send_email_on_fail(
     to_addr = (smtp.to_email or "").strip()
     host = (smtp.host or "").strip()
     user = (smtp.username or "").strip()
-
     if not to_addr or not host or not user:
         return
-
-    if smtp.only_on_transition_to_down:
-        if (profile.last_status or "").lower() == "down":
-            return
 
     password = _get_password_from_credential_manager(error_log_path, user)
     if not password:
@@ -224,7 +204,6 @@ class MonitorEngine:
             if self._running:
                 return
             self._running = True
-
         self._thread = threading.Thread(target=self._loop, name="DownDetectorEngine", daemon=True)
         self._thread.start()
 
@@ -258,7 +237,6 @@ class MonitorEngine:
         interval = int(p.interval_seconds)
         if interval <= 0:
             return
-
         if now < start_dt:
             return
 
@@ -289,8 +267,16 @@ class MonitorEngine:
         }
         append_log_record(self.log_dir, self.meta_path, self.error_log_path, record)
 
+        # Robust transition logic
+        if status == "up":
+            p.down_notified = False
+
         if status == "down":
-            send_email_on_fail(smtp, self.error_log_path, p, scheduled_time, details, http_status, latency_ms)
+            if smtp.only_on_transition_to_down and p.down_notified:
+                pass
+            else:
+                send_email_on_fail(smtp, self.error_log_path, p, scheduled_time, details, http_status, latency_ms)
+                p.down_notified = True
 
         with self._lock:
             p.last_interval_index_ran = current_index
