@@ -22,6 +22,26 @@ MAX_WIDGET_SLOTS = 20
 ensure_dir(LOG_DIR)
 
 
+# Runtime-only fields are intentionally NOT persisted.
+PROFILE_PERSIST_KEYS = [
+    "profile_id",
+    "display_name",
+    "url",
+    "start_datetime",
+    "interval_seconds",
+    "success_rules",
+    "failure_rules",
+]
+
+
+def _profile_to_persist_dict(p: Profile) -> dict:
+    d = asdict(p)
+    out = {}
+    for k in PROFILE_PERSIST_KEYS:
+        out[k] = d.get(k)
+    return out
+
+
 def load_config() -> AppConfig:
     raw = read_json(PROFILES_PATH, {"profiles": [], "smtp": {}})
     cfg = AppConfig()
@@ -38,29 +58,36 @@ def load_config() -> AppConfig:
         if not isinstance(p, dict):
             continue
         try:
-            profiles.append(Profile(
-                profile_id=str(p.get("profile_id", "")),
-                display_name=str(p.get("display_name", "")),
-                url=str(p.get("url", "")),
-                start_datetime=str(p.get("start_datetime", "")),
-                interval_seconds=int(p.get("interval_seconds", 0)),
-                success_rules=list(p.get("success_rules", []) or []),
-                failure_rules=list(p.get("failure_rules", []) or []),
-                last_interval_index_ran=p.get("last_interval_index_ran", None),
-                last_status=p.get("last_status", None),
-                down_notified=bool(p.get("down_notified", False)),
-            ))
+            # NOTE: We do NOT load last_status / last_interval_index_ran / down_notified from disk.
+            profiles.append(
+                Profile(
+                    profile_id=str(p.get("profile_id", "")),
+                    display_name=str(p.get("display_name", "")),
+                    url=str(p.get("url", "")),
+                    start_datetime=str(p.get("start_datetime", "")),
+                    interval_seconds=int(p.get("interval_seconds", 0)),
+                    success_rules=list(p.get("success_rules", []) or []),
+                    failure_rules=list(p.get("failure_rules", []) or []),
+                    last_interval_index_ran=None,
+                    last_status=None,
+                    down_notified=False,
+                )
+            )
         except Exception:
             continue
 
-    cfg.profiles = [p for p in profiles if p.profile_id and p.display_name and p.url and p.start_datetime and p.interval_seconds > 0]
+    cfg.profiles = [
+        p
+        for p in profiles
+        if p.profile_id and p.display_name and p.url and p.start_datetime and p.interval_seconds > 0
+    ]
     return cfg
 
 
 def save_config(cfg: AppConfig) -> None:
     try:
         data = {
-            "profiles": [asdict(p) for p in cfg.profiles],
+            "profiles": [_profile_to_persist_dict(p) for p in cfg.profiles],
             "smtp": asdict(cfg.smtp),
         }
         write_json(PROFILES_PATH, data)
@@ -80,7 +107,9 @@ def ui_get_slots():
     updates = []
 
     if len(profiles) == 0:
-        updates.append((gr.update(visible=True), render_empty_dashboard_html(), "", gr.update(value="Edit", visible=False)))
+        updates.append(
+            (gr.update(visible=True), render_empty_dashboard_html(), "", gr.update(value="Edit", visible=False))
+        )
         for _ in range(1, MAX_WIDGET_SLOTS):
             updates.append((gr.update(visible=False), "", "", gr.update(value="Edit", visible=False)))
         return updates
@@ -111,13 +140,18 @@ def _split_interval(seconds: int):
 def ui_open_add_form():
     return (
         gr.update(visible=True),
-        "", "", iso(now_local()),
+        "",
+        "",
+        iso(now_local()),
         gr.update(value=0, interactive=True),
         gr.update(value=0, interactive=True),
         gr.update(value=5, interactive=True),
         gr.update(value=0, interactive=True),
-        "", "Application is not available",
-        "", "", gr.update(visible=False),
+        "",
+        "Application is not available",
+        "",
+        "",
+        gr.update(visible=False),
     )
 
 
@@ -129,7 +163,21 @@ def ui_open_edit_form(profile_id: str):
             p = x
             break
     if not p:
-        return (gr.update(visible=False), "", "", "", gr.update(value=0), gr.update(value=0), gr.update(value=0), gr.update(value=0), "", "", "Profile not found.", "", gr.update(visible=False))
+        return (
+            gr.update(visible=False),
+            "",
+            "",
+            "",
+            gr.update(value=0),
+            gr.update(value=0),
+            gr.update(value=0),
+            gr.update(value=0),
+            "",
+            "",
+            "Profile not found.",
+            "",
+            gr.update(visible=False),
+        )
 
     dd, hh, mm, ss = _split_interval(p.interval_seconds)
 
@@ -173,6 +221,9 @@ def ui_save_add(display_name: str, url: str, start_dt: str, dd, hh, mm, ss, succ
             interval_seconds=int(interval_seconds),
             success_rules=normalize_rule_list(success_rules_text),
             failure_rules=normalize_rule_list(failure_rules_text),
+            last_interval_index_ran=None,
+            last_status=None,
+            down_notified=False,
         )
 
         ENGINE.add_profile(p)
@@ -270,7 +321,10 @@ def ui_send_test_email(enabled: bool, to_email: str, host: str, port: int, usern
             from_email=(from_email or "").strip(),
             only_on_transition_to_down=bool(only_transition),
         )
-        safe_write_error(ERROR_LOG_PATH, "Test email clicked: enabled=" + str(s.enabled) + " host=" + (s.host or "") + " port=" + str(s.port or "") + " user=" + (s.username or "") + " to=" + (s.to_email or ""))
+        safe_write_error(
+            ERROR_LOG_PATH,
+            "Test email clicked: enabled=" + str(s.enabled) + " host=" + (s.host or "") + " port=" + str(s.port or "") + " user=" + (s.username or "") + " to=" + (s.to_email or ""),
+        )
         ok, msg = send_test_email(s, ERROR_LOG_PATH)
         return msg
     except Exception as e:
@@ -284,13 +338,16 @@ with gr.Blocks(title="Down Detector", theme=gr.themes.Soft()) as demo:
         add_btn = gr.Button("Add", size="sm")
 
     slot_groups, slot_cards, slot_pids, slot_edit_btns = [], [], [], []
+
     with gr.Group():
         for _ in range(MAX_WIDGET_SLOTS):
             with gr.Group(visible=False) as g:
                 with gr.Row():
-                    card = gr.HTML(scale=9, min_width=0)
-                    pid_state = gr.State("")
-                    edit_btn = gr.Button("Edit", size="sm", visible=False, scale=1, min_width=90)
+                    with gr.Column(scale=9, min_width=0):
+                        card = gr.HTML()
+                        pid_state = gr.State("")
+                    with gr.Column(scale=1, min_width=110):
+                        edit_btn = gr.Button("Edit", size="sm", visible=False)
                 slot_groups.append(g)
                 slot_cards.append(card)
                 slot_pids.append(pid_state)
@@ -361,7 +418,7 @@ with gr.Blocks(title="Down Detector", theme=gr.themes.Soft()) as demo:
 
     add_btn.click(
         fn=ui_open_add_form,
-        outputs=[editor_group, display_name_in, url_in, start_dt_in, dd_in, hh_in, mm_in, ss_in, success_rules_in, failure_rules_in, save_msg, edit_profile_id, delete_btn]
+        outputs=[editor_group, display_name_in, url_in, start_dt_in, dd_in, hh_in, mm_in, ss_in, success_rules_in, failure_rules_in, save_msg, edit_profile_id, delete_btn],
     )
 
     def open_edit_from_pid(pid: str):
@@ -373,7 +430,7 @@ with gr.Blocks(title="Down Detector", theme=gr.themes.Soft()) as demo:
         slot_edit_btns[i].click(
             fn=open_edit_from_pid,
             inputs=[slot_pids[i]],
-            outputs=[editor_group, display_name_in, url_in, start_dt_in, dd_in, hh_in, mm_in, ss_in, success_rules_in, failure_rules_in, save_msg, edit_profile_id, delete_btn]
+            outputs=[editor_group, display_name_in, url_in, start_dt_in, dd_in, hh_in, mm_in, ss_in, success_rules_in, failure_rules_in, save_msg, edit_profile_id, delete_btn],
         )
 
     def do_save(edit_pid: str, display_name: str, url: str, start_dt: str, dd, hh, mm, ss, sr: str, fr: str):
@@ -384,16 +441,14 @@ with gr.Blocks(title="Down Detector", theme=gr.themes.Soft()) as demo:
     save_btn.click(
         fn=do_save,
         inputs=[edit_profile_id, display_name_in, url_in, start_dt_in, dd_in, hh_in, mm_in, ss_in, success_rules_in, failure_rules_in],
-        outputs=save_msg
+        outputs=save_msg,
     ).then(fn=apply_slot_updates, outputs=slot_outputs)
 
     delete_btn.click(
         fn=ui_delete_profile,
         inputs=[edit_profile_id],
-        outputs=save_msg
-    ).then(fn=lambda: gr.update(visible=False), outputs=editor_group
-    ).then(fn=lambda: "", outputs=edit_profile_id
-    ).then(fn=apply_slot_updates, outputs=slot_outputs)
+        outputs=save_msg,
+    ).then(fn=lambda: gr.update(visible=False), outputs=editor_group).then(fn=lambda: "", outputs=edit_profile_id).then(fn=apply_slot_updates, outputs=slot_outputs)
 
     close_btn.click(fn=lambda: gr.update(visible=False), outputs=editor_group)
 
