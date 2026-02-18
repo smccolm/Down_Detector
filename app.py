@@ -4,12 +4,11 @@ from dataclasses import asdict
 
 import gradio as gr
 
-from engine import MonitorEngine
+from engine import MonitorEngine, send_test_email
 from models import AppConfig, Profile, SmtpSettings
 from storage import ensure_dir, read_json, safe_write_error, write_json
-from ui import render_dashboard_html
+from ui import render_card_html, render_empty_dashboard_html
 from utils import duration_to_seconds, iso, normalize_rule_list, now_local, parse_datetime_user
-
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(APP_DIR, "Logs")
@@ -18,6 +17,7 @@ LOG_META_PATH = os.path.join(LOG_DIR, "log_meta.json")
 ERROR_LOG_PATH = os.path.join(LOG_DIR, "error.log")
 
 DEFAULT_REFRESH_SECONDS = 1.0
+MAX_WIDGET_SLOTS = 20
 
 ensure_dir(LOG_DIR)
 
@@ -72,14 +72,48 @@ ENGINE = MonitorEngine(CFG, LOG_DIR, LOG_META_PATH, ERROR_LOG_PATH)
 ENGINE.start()
 
 
-def ui_dashboard() -> str:
+def ui_get_slots():
     cfg = ENGINE.get_snapshot()
-    return render_dashboard_html(cfg.profiles, ENGINE.get_last30_bars)
+    profiles = list(cfg.profiles)
 
+    updates = []
 
-def ui_profile_choices():
-    cfg = ENGINE.get_snapshot()
-    return [(p.display_name, p.profile_id) for p in cfg.profiles]
+    if len(profiles) == 0:
+        updates.append((
+            gr.update(visible=True),
+            render_empty_dashboard_html(),
+            "",
+            gr.update(value="Edit", visible=False),
+        ))
+        for _ in range(1, MAX_WIDGET_SLOTS):
+            updates.append((
+                gr.update(visible=False),
+                "",
+                "",
+                gr.update(value="Edit", visible=False),
+            ))
+        return updates
+
+    for i in range(MAX_WIDGET_SLOTS):
+        if i < len(profiles):
+            p = profiles[i]
+            bars = ENGINE.get_last30_bars(p)
+            html = render_card_html(p, bars)
+            updates.append((
+                gr.update(visible=True),
+                html,
+                p.profile_id,
+                gr.update(value="Edit", visible=True),
+            ))
+        else:
+            updates.append((
+                gr.update(visible=False),
+                "",
+                "",
+                gr.update(value="Edit", visible=False),
+            ))
+
+    return updates
 
 
 def ui_open_add_form():
@@ -93,8 +127,8 @@ def ui_open_add_form():
         "Application is not available",  # failure rules
         "",  # msg
         "",  # edit_profile_id
-        gr.update(visible=True),  # interval row visible for add
-        gr.update(visible=False),  # delete visible? no, add mode
+        gr.update(visible=True),   # interval row visible for add
+        gr.update(visible=False),  # delete hidden for add
     )
 
 
@@ -105,10 +139,11 @@ def ui_open_edit_form(profile_id: str):
         if x.profile_id == profile_id:
             p = x
             break
+
     if not p:
         return (
             gr.update(visible=False),
-            "", "", "", 0, 0, 0, 0, "", "", "Pick a valid profile.", "", gr.update(visible=False), gr.update(visible=False)
+            "", "", "", 0, 0, 0, 0, "", "", "Profile not found.", "", gr.update(visible=False), gr.update(visible=False)
         )
 
     dd = p.interval_seconds // 86400
@@ -128,7 +163,7 @@ def ui_open_edit_form(profile_id: str):
         "\n".join(p.failure_rules),
         "",
         p.profile_id,
-        gr.update(visible=False),  # interval row hidden for edit (read-only)
+        gr.update(visible=False),  # interval row hidden for edit
         gr.update(visible=True),   # delete visible
     )
 
@@ -216,10 +251,10 @@ def ui_delete_profile(profile_id: str) -> str:
 def ui_get_smtp_snapshot():
     cfg = ENGINE.get_snapshot()
     s = cfg.smtp
-    return (s.enabled, s.to_email, s.host, s.port, s.username, s.password, s.use_tls, s.from_email, s.only_on_transition_to_down)
+    return (s.enabled, s.to_email, s.host, s.port, s.username, s.use_tls, s.from_email, s.only_on_transition_to_down)
 
 
-def ui_save_smtp(enabled: bool, to_email: str, host: str, port: int, username: str, password: str, use_tls: bool, from_email: str, only_transition: bool) -> str:
+def ui_save_smtp(enabled: bool, to_email: str, host: str, port: int, username: str, use_tls: bool, from_email: str, only_transition: bool) -> str:
     try:
         s = SmtpSettings(
             enabled=bool(enabled),
@@ -227,32 +262,84 @@ def ui_save_smtp(enabled: bool, to_email: str, host: str, port: int, username: s
             host=(host or "").strip(),
             port=int(port or 0) if str(port or "").strip() else 0,
             username=(username or "").strip(),
-            password=(password or ""),
+            password="",  # not stored, pulled from Credential Manager
             use_tls=bool(use_tls),
             from_email=(from_email or "").strip(),
             only_on_transition_to_down=bool(only_transition),
         )
         ENGINE.set_smtp(s)
         save_config(ENGINE.get_snapshot())
-        return "Email settings saved."
+        safe_write_error(ERROR_LOG_PATH, "SMTP settings saved (password via Credential Manager). enabled=" + str(s.enabled))
+        return "Email settings saved. Password is read from Windows Credential Manager (DownDetectorSMTP)."
     except Exception as e:
         safe_write_error(ERROR_LOG_PATH, "Save SMTP failed:\n" + repr(e))
         return "Save failed: " + repr(e)
 
 
+def ui_send_test_email(
+    enabled: bool,
+    to_email: str,
+    host: str,
+    port: int,
+    username: str,
+    use_tls: bool,
+    from_email: str,
+    only_transition: bool,
+) -> str:
+    """
+    Uses CURRENT UI values, not saved config. This lets you test without clicking Save first.
+    Always writes a trace line to Logs/error.log.
+    """
+    try:
+        s = SmtpSettings(
+            enabled=bool(enabled),
+            to_email=(to_email or "").strip(),
+            host=(host or "").strip(),
+            port=int(port or 0) if str(port or "").strip() else 0,
+            username=(username or "").strip(),
+            password="",  # pulled from Credential Manager
+            use_tls=bool(use_tls),
+            from_email=(from_email or "").strip(),
+            only_on_transition_to_down=bool(only_transition),
+        )
+
+        safe_write_error(
+            ERROR_LOG_PATH,
+            "Test email clicked: enabled=" + str(s.enabled) +
+            " host=" + (s.host or "") +
+            " port=" + str(s.port or "") +
+            " user=" + (s.username or "") +
+            " to=" + (s.to_email or "")
+        )
+
+        ok, msg = send_test_email(s, ERROR_LOG_PATH)
+        return msg
+    except Exception as e:
+        safe_write_error(ERROR_LOG_PATH, "UI test email failed: " + repr(e))
+        return "Test email failed. Check Logs/error.log: " + repr(e)
+
+
 with gr.Blocks(title="Down Detector", theme=gr.themes.Soft()) as demo:
     with gr.Row():
         gr.Markdown("## Down Detector")
-        add_btn = gr.Button("＋", size="sm")
+        add_btn = gr.Button("Add", size="sm")
 
-    dashboard = gr.HTML(value=ui_dashboard())
+    slot_groups = []
+    slot_cards = []
+    slot_pids = []
+    slot_edit_btns = []
 
-    timer = gr.Timer(DEFAULT_REFRESH_SECONDS)
-    timer.tick(fn=ui_dashboard, outputs=dashboard)
-
-    with gr.Row():
-        profile_pick = gr.Dropdown(choices=ui_profile_choices(), label="Select profile to edit", value=None, interactive=True)
-        edit_btn = gr.Button("⚙ Edit selected", size="sm")
+    with gr.Group():
+        for i in range(MAX_WIDGET_SLOTS):
+            with gr.Group(visible=False) as g:
+                with gr.Row():
+                    card = gr.HTML()
+                    pid_state = gr.State("")
+                    edit_btn = gr.Button("Edit", size="sm", visible=False)
+                slot_groups.append(g)
+                slot_cards.append(card)
+                slot_pids.append(pid_state)
+                slot_edit_btns.append(edit_btn)
 
     with gr.Group(visible=False) as editor_group:
         edit_profile_id = gr.State("")
@@ -290,46 +377,64 @@ with gr.Blocks(title="Down Detector", theme=gr.themes.Soft()) as demo:
 
     with gr.Accordion("Email on fail (optional)", open=False):
         enabled_in = gr.Checkbox(label="Enable email on failure", value=False)
-        to_email_in = gr.Textbox(label="To email address", placeholder="you@example.com")
-        host_in = gr.Textbox(label="SMTP host", placeholder="smtp.office365.com")
+        to_email_in = gr.Textbox(label="To email address", placeholder="you@company.com or you@gmail.com")
+        host_in = gr.Textbox(label="SMTP host", placeholder="smtp.gmail.com")
         port_in = gr.Number(label="SMTP port", value=587, precision=0)
-        username_in = gr.Textbox(label="SMTP username", placeholder="user@domain.com")
-        password_in = gr.Textbox(label="SMTP password", type="password")
+        username_in = gr.Textbox(label="SMTP username", placeholder="you@gmail.com")
         use_tls_in = gr.Checkbox(label="Use TLS (STARTTLS)", value=True)
-        from_email_in = gr.Textbox(label="From email (optional)", placeholder="monitor@domain.com")
+        from_email_in = gr.Textbox(label="From email (optional)", placeholder="you@gmail.com")
         only_transition_in = gr.Checkbox(label="Only email when status transitions to Down", value=True)
-        save_smtp_btn = gr.Button("Save email settings")
+
+        with gr.Row():
+            save_smtp_btn = gr.Button("Save email settings")
+            test_email_btn = gr.Button("Send test email", variant="secondary")
+
         smtp_msg = gr.Markdown("")
+        test_msg = gr.Markdown("")
+
+        gr.Markdown(
+            "Password is not entered here. Store it in Windows Credential Manager as a Generic Credential named `DownDetectorSMTP` with username equal to the SMTP username."
+        )
 
     demo.load(fn=ui_get_smtp_snapshot, outputs=[
-        enabled_in, to_email_in, host_in, port_in, username_in, password_in, use_tls_in, from_email_in, only_transition_in
+        enabled_in, to_email_in, host_in, port_in, username_in, use_tls_in, from_email_in, only_transition_in
     ])
-    demo.load(fn=ui_profile_choices, outputs=profile_pick)
 
-    def refresh_picker():
-        return ui_profile_choices()
+    timer = gr.Timer(DEFAULT_REFRESH_SECONDS)
 
-    def open_add():
-        return ui_open_add_form()
+    def apply_slot_updates():
+        upd = ui_get_slots()
+        outs = []
+        for (g_upd, html, pid, btn_upd) in upd:
+            outs.extend([g_upd, html, pid, btn_upd])
+        return outs
 
-    def open_edit(profile_id: str):
-        if not profile_id:
-            return (
-                gr.update(visible=False),
-                "", "", "", 0, 0, 0, 0, "", "", "Pick a profile first.", "", gr.update(visible=False), gr.update(visible=False)
-            )
-        return ui_open_edit_form(profile_id)
+    slot_outputs = []
+    for i in range(MAX_WIDGET_SLOTS):
+        slot_outputs.extend([slot_groups[i], slot_cards[i], slot_pids[i], slot_edit_btns[i]])
+
+    demo.load(fn=apply_slot_updates, outputs=slot_outputs)
+    timer.tick(fn=apply_slot_updates, outputs=slot_outputs)
 
     add_btn.click(
-        fn=open_add,
-        outputs=[editor_group, display_name_in, url_in, start_dt_in, dd_in, hh_in, mm_in, ss_in, success_rules_in, failure_rules_in, save_msg, edit_profile_id, interval_row, delete_btn]
-    ).then(fn=refresh_picker, outputs=profile_pick).then(fn=ui_dashboard, outputs=dashboard)
-
-    edit_btn.click(
-        fn=open_edit,
-        inputs=[profile_pick],
+        fn=ui_open_add_form,
         outputs=[editor_group, display_name_in, url_in, start_dt_in, dd_in, hh_in, mm_in, ss_in, success_rules_in, failure_rules_in, save_msg, edit_profile_id, interval_row, delete_btn]
     )
+
+    def open_edit_from_pid(pid: str):
+        if not pid:
+            return (
+                gr.update(visible=False),
+                "", "", "", 0, 0, 0, 0, "", "", "Profile not found.", "", gr.update(visible=False), gr.update(visible=False)
+            )
+        return ui_open_edit_form(pid)
+
+    for i in range(MAX_WIDGET_SLOTS):
+        slot_edit_btns[i].click(
+            fn=open_edit_from_pid,
+            inputs=[slot_pids[i]],
+            outputs=[editor_group, display_name_in, url_in, start_dt_in, dd_in, hh_in, mm_in, ss_in, success_rules_in, failure_rules_in, save_msg, edit_profile_id, interval_row, delete_btn]
+        )
 
     def do_save(edit_pid: str, display_name: str, url: str, start_dt: str, dd, hh, mm, ss, sr: str, fr: str):
         if edit_pid:
@@ -340,7 +445,7 @@ with gr.Blocks(title="Down Detector", theme=gr.themes.Soft()) as demo:
         fn=do_save,
         inputs=[edit_profile_id, display_name_in, url_in, start_dt_in, dd_in, hh_in, mm_in, ss_in, success_rules_in, failure_rules_in],
         outputs=save_msg
-    ).then(fn=refresh_picker, outputs=profile_pick).then(fn=ui_dashboard, outputs=dashboard)
+    ).then(fn=apply_slot_updates, outputs=slot_outputs)
 
     delete_btn.click(
         fn=ui_delete_profile,
@@ -348,15 +453,20 @@ with gr.Blocks(title="Down Detector", theme=gr.themes.Soft()) as demo:
         outputs=save_msg
     ).then(fn=lambda: gr.update(visible=False), outputs=editor_group
     ).then(fn=lambda: "", outputs=edit_profile_id
-    ).then(fn=refresh_picker, outputs=profile_pick
-    ).then(fn=ui_dashboard, outputs=dashboard)
+    ).then(fn=apply_slot_updates, outputs=slot_outputs)
 
     close_btn.click(fn=lambda: gr.update(visible=False), outputs=editor_group)
 
     save_smtp_btn.click(
         fn=ui_save_smtp,
-        inputs=[enabled_in, to_email_in, host_in, port_in, username_in, password_in, use_tls_in, from_email_in, only_transition_in],
+        inputs=[enabled_in, to_email_in, host_in, port_in, username_in, use_tls_in, from_email_in, only_transition_in],
         outputs=smtp_msg
+    )
+
+    test_email_btn.click(
+        fn=ui_send_test_email,
+        inputs=[enabled_in, to_email_in, host_in, port_in, username_in, use_tls_in, from_email_in, only_transition_in],
+        outputs=test_msg
     )
 
     gr.Markdown("Data files are stored in `./Logs/` next to `app.py`. Main log files rotate after 2000 records. App issues go to `Logs/error.log`.")

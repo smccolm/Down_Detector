@@ -12,8 +12,101 @@ from models import AppConfig, Profile, SmtpSettings
 from storage import append_log_record, safe_write_error, scan_history_from_logs
 from utils import iso, now_local, parse_datetime_user, rule_matches
 
-
 REQUEST_TIMEOUT_SECONDS = 10.0
+CRED_SERVICE_NAME = "DownDetectorSMTP"
+
+
+def _get_password_from_credential_manager(error_log_path: str, username: str) -> str:
+    """
+    Reads a password stored in Windows Credential Manager using keyring.
+
+    Credential must exist as:
+      - Generic Credential name: DownDetectorSMTP
+      - User name: <smtp username> (for Gmail, your@gmail.com)
+      - Password: app password
+    """
+    user = (username or "").strip()
+    if not user:
+        return ""
+
+    try:
+        import keyring  # pip install keyring
+    except Exception as e:
+        safe_write_error(error_log_path, "keyring not available. Install with: pip install keyring. " + repr(e))
+        return ""
+
+    try:
+        pw = keyring.get_password(CRED_SERVICE_NAME, user)
+        return (pw or "").strip()
+    except Exception as e:
+        safe_write_error(error_log_path, "Failed reading Credential Manager password via keyring: " + repr(e))
+        return ""
+
+
+def _build_email_message(subject: str, from_addr: str, to_addr: str, lines: List[str]) -> EmailMessage:
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = from_addr
+    msg["To"] = to_addr
+    msg.set_content("\n".join(lines))
+    return msg
+
+
+def send_test_email(smtp: SmtpSettings, error_log_path: str) -> Tuple[bool, str]:
+    """
+    Sends a single test email using the same settings as failure emails.
+    Returns (ok, message).
+    """
+    if not smtp.enabled:
+        return (False, "Email is disabled. Enable it first.")
+
+    to_addr = (smtp.to_email or "").strip()
+    host = (smtp.host or "").strip()
+    user = (smtp.username or "").strip()
+
+    if not to_addr:
+        return (False, "To email address is required.")
+    if not host:
+        return (False, "SMTP host is required.")
+    if not user:
+        return (False, "SMTP username is required.")
+
+    password = _get_password_from_credential_manager(error_log_path, user)
+    if not password:
+        safe_write_error(
+            error_log_path,
+            f"Test email failed: no password found in Credential Manager for service '{CRED_SERVICE_NAME}' and username '{user}'.",
+        )
+        return (False, f"No password found in Credential Manager for {user} under {CRED_SERVICE_NAME}.")
+
+    from_addr = (smtp.from_email or "").strip() or user
+    port = int(smtp.port or 0) or 587
+
+    subject = "Down Detector: Test email"
+    lines = [
+        "This is a test email from Down Detector.",
+        f"Sent at: {iso(now_local())}",
+        f"SMTP host: {host}",
+        f"SMTP port: {port}",
+        f"SMTP username: {user}",
+        f"To: {to_addr}",
+        "If you received this, SMTP wiring is working.",
+    ]
+    msg = _build_email_message(subject, from_addr, to_addr, lines)
+
+    try:
+        safe_write_error(error_log_path, f"Test email: attempting send to '{to_addr}' via '{host}:{port}' as '{user}'")
+        server = smtplib.SMTP(host, port, timeout=15)
+        if smtp.use_tls:
+            server.starttls()
+        server.login(user, password)
+        server.send_message(msg)
+        server.quit()
+        safe_write_error(error_log_path, "Test email: send ok")
+        return (True, f"Test email sent to {to_addr}. Check inbox and spam/quarantine.")
+    except Exception as e:
+        safe_write_error(error_log_path, "Test email: send failed: " + repr(e))
+        return (False, "Test email failed. Check Logs/error.log for details: " + repr(e))
 
 
 def check_url(profile: Profile) -> Tuple[str, Optional[int], Optional[int], str]:
@@ -27,7 +120,7 @@ def check_url(profile: Profile) -> Tuple[str, Optional[int], Optional[int], str]
             profile.url,
             timeout=REQUEST_TIMEOUT_SECONDS,
             allow_redirects=True,
-            headers={"User-Agent": "DownDetector/1.0"}
+            headers={"User-Agent": "DownDetector/1.0"},
         )
         latency_ms = int((time.time() - t0) * 1000)
         http_status = int(resp.status_code)
@@ -61,29 +154,34 @@ def send_email_on_fail(
     scheduled_time,
     status_details: str,
     http_status: Optional[int],
-    latency_ms: Optional[int]
+    latency_ms: Optional[int],
 ) -> None:
     if not smtp.enabled:
         return
 
     to_addr = (smtp.to_email or "").strip()
     host = (smtp.host or "").strip()
-    if not to_addr or not host:
+    user = (smtp.username or "").strip()
+
+    if not to_addr or not host or not user:
         return
 
     if smtp.only_on_transition_to_down:
         if (profile.last_status or "").lower() == "down":
             return
 
-    from_addr = (smtp.from_email or "").strip()
-    if not from_addr:
-        from_addr = (smtp.username or "").strip() or "down-detector@localhost"
+    password = _get_password_from_credential_manager(error_log_path, user)
+    if not password:
+        safe_write_error(
+            error_log_path,
+            f"Email enabled but no password found in Credential Manager for service '{CRED_SERVICE_NAME}' and username '{user}'.",
+        )
+        return
 
-    msg = EmailMessage()
-    msg["Subject"] = f"Down Detector: DOWN - {profile.display_name}"
-    msg["From"] = from_addr
-    msg["To"] = to_addr
+    from_addr = (smtp.from_email or "").strip() or user
+    port = int(smtp.port or 0) or 587
 
+    subject = f"Down Detector: DOWN - {profile.display_name}"
     lines = [
         f"Site: {profile.display_name}",
         f"Scheduled time: {iso(scheduled_time)}",
@@ -93,22 +191,13 @@ def send_email_on_fail(
         f"Latency ms: {latency_ms if latency_ms is not None else 'N/A'}",
         f"Details: {status_details}",
     ]
-    msg.set_content("\n".join(lines))
+    msg = _build_email_message(subject, from_addr, to_addr, lines)
 
     try:
-        port = int(smtp.port or 0) or 587
-
+        server = smtplib.SMTP(host, port, timeout=15)
         if smtp.use_tls:
-            server = smtplib.SMTP(host, port)
             server.starttls()
-        else:
-            server = smtplib.SMTP(host, port)
-
-        user = (smtp.username or "").strip()
-        pwd = (smtp.password or "").strip()
-        if user and pwd:
-            server.login(user, pwd)
-
+        server.login(user, password)
         server.send_message(msg)
         server.quit()
     except Exception as e:
@@ -201,9 +290,7 @@ class MonitorEngine:
         append_log_record(self.log_dir, self.meta_path, self.error_log_path, record)
 
         if status == "down":
-            send_email_on_fail(
-                smtp, self.error_log_path, p, scheduled_time, details, http_status, latency_ms
-            )
+            send_email_on_fail(smtp, self.error_log_path, p, scheduled_time, details, http_status, latency_ms)
 
         with self._lock:
             p.last_interval_index_ran = current_index
@@ -254,10 +341,6 @@ class MonitorEngine:
                 del self.history_cache[profile_id]
 
     def get_last30_bars(self, p: Profile) -> List[str]:
-        """
-        Returns 30 statuses: "untested"|"up"|"down"
-        Based on interval indices relative to the profile start time.
-        """
         try:
             now = now_local()
             start_dt = parse_datetime_user(p.start_datetime)
