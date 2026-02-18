@@ -15,6 +15,9 @@ from utils import iso, now_local, parse_datetime_user, rule_matches
 REQUEST_TIMEOUT_SECONDS = 10.0
 CRED_SERVICE_NAME = "DownDetectorSMTP"
 
+# UI history bar count (was 30)
+HISTORY_BARS = 120
+
 
 def _get_password_from_credential_manager(error_log_path: str, username: str) -> str:
     user = (username or "").strip()
@@ -326,20 +329,22 @@ class MonitorEngine:
             if profile_id in self.history_cache:
                 del self.history_cache[profile_id]
 
+    # Keep method name for app.py compatibility, but return HISTORY_BARS bars
     def get_last30_bars(self, p: Profile) -> List[str]:
         try:
             now = now_local()
             start_dt = parse_datetime_user(p.start_datetime)
             if now < start_dt:
-                return ["untested"] * 30
+                return ["untested"] * HISTORY_BARS
 
             interval = int(p.interval_seconds)
             if interval <= 0:
-                return ["untested"] * 30
+                return ["untested"] * HISTORY_BARS
 
             elapsed = (now - start_dt).total_seconds()
             cur = int(elapsed // interval)
-            start_idx = cur - 29
+
+            start_idx = cur - (HISTORY_BARS - 1)
 
             with self._lock:
                 cache = dict(self.history_cache.get(p.profile_id, {}))
@@ -352,4 +357,4 @@ class MonitorEngine:
                     out.append("untested")
             return out
         except Exception:
-            return ["untested"] * 30
+            return ["untested"] * HISTORY_BARS
