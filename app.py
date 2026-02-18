@@ -288,9 +288,9 @@ with gr.Blocks(title="Down Detector", theme=gr.themes.Soft()) as demo:
         for _ in range(MAX_WIDGET_SLOTS):
             with gr.Group(visible=False) as g:
                 with gr.Row():
-                    card = gr.HTML()
+                    card = gr.HTML(scale=9, min_width=0)
                     pid_state = gr.State("")
-                    edit_btn = gr.Button("Edit", size="sm", visible=False)
+                    edit_btn = gr.Button("Edit", size="sm", visible=False, scale=1, min_width=90)
                 slot_groups.append(g)
                 slot_cards.append(card)
                 slot_pids.append(pid_state)
