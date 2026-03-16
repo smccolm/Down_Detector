@@ -114,6 +114,25 @@ def check_url(profile: Profile) -> Tuple[str, Optional[int], Optional[int], str]
         http_status = int(resp.status_code)
         body = resp.text or ""
 
+        # Optional per-profile override: allow certain HTTP codes to be treated as success.
+        # Add a line to Success match rules like: "http_success_codes: 405" or "http_success_codes: 200,302,405".
+        allowed_codes = set()
+        for r in (profile.success_rules or []):
+            rr = (r or "").strip()
+            if rr.lower().startswith("http_success_codes:"):
+                tail = rr.split(":", 1)[1] if ":" in rr else ""
+                for part in tail.replace(";", ",").split(","):
+                    part = part.strip()
+                    if not part:
+                        continue
+                    try:
+                        allowed_codes.add(int(part))
+                    except Exception:
+                        pass
+
+        if http_status in allowed_codes:
+            return ("up", http_status, latency_ms, f"HTTP {http_status} allowed")
+
         for fr in profile.failure_rules:
             if rule_matches(fr, body):
                 return ("down", http_status, latency_ms, f"Failure rule matched: {fr}")
